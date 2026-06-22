@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: atlantis-worker-cache
+  name: atlantis-frontend
   labels:
     app.kubernetes.io/name: atlantis
     app.kubernetes.io/part-of: atlantis
